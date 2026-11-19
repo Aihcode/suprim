@@ -128,3 +128,19 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# PrintFlow ERP / PrintBridge
+.env*
+!**/.env.example
+uploads/
+prisma/*.db
+prisma/*.db-journal
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+desktop/printbridge/local_queue.db
+desktop/printbridge/printbridge.log
+desktop/**/__pycache__/
+desktop/**/*.pyc
+.db-config.json

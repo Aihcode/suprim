@@ -1,0 +1,237 @@
+// =============================================================================
+// PrintFlow ERP — Prisma schema
+// =============================================================================
+// MOTOR POR DEFECTO: SQLite (`file:./dev.db`). Arranque inmediato, sin servicios
+// externos. El código de la aplicación NO cambia al cambiar de motor.
+//
+// CÓMO CAMBIAR DE MOTOR (solo configuración + regenerate):
+//   1. Edita `.env`:  DATABASE_URL="postgresql://user:pass@host:5432/printflow"
+//                     (o `mysql://...`, o `sqlserver://...`).
+//   2. Edita SOLO la línea `provider` de este bloque `datasource db`:
+//        provider = "postgresql"   // PostgreSQL
+//        provider = "mysql"        // MySQL / MariaDB
+//        provider = "sqlserver"    // SQL Server
+//      (volver a "sqlite" + DATABASE_URL="file:./dev.db" revierte el cambio).
+//   3. `npx prisma generate && npx prisma db push` (o `prisma migrate dev`).
+//
+// El endpoint PATCH /api/admin/db-config escribe `.db-config.json` con el motor
+// deseado como documentación operativa; el cambio real de provider requiere
+// editar este archivo y reiniciar el servidor (Prisma no acepta provider
+// dinámico en tiempo de ejecución).
+//
+// NOTA: Se usan `String` + JSON serializado en lugar del tipo `Json` para que
+// el mismo schema sea portable a SQLite. Enums también son `String` con
+// valores controlados por validación zod en las API routes.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// Usuarios de la plataforma. role: CLIENT | EMPLOYEE | ADMIN
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String // bcrypt hash
+  name      String
+  role      String   @default("CLIENT")
+  freePages Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orders Order[]
+
+  @@index([role])
+}
+
+/// Computadora con agente PrintBridge instalado. os: WINDOWS | LINUX | MACOS
+model Station {
+  id           String    @id @default(cuid())
+  name         String
+  token        String    @unique // JWT firmado con JWT_SECRET
+  computerName String
+  os           String
+  lastSeen     DateTime?
+  active       Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+
+  printers  Printer[]
+  orders    Order[]
+  printJobs PrintJob[]
+
+  @@index([active])
+}
+
+/// Impresora local / de red. type: LOCAL | NETWORK | SHARED
+/// protocol: IPP | CUPS | RAW | SMB. capabilities: String JSON.
+model Printer {
+  id           String   @id @default(cuid())
+  name         String
+  type         String
+  ip           String?
+  port         Int?
+  protocol     String?
+  capabilities String // JSON: { color, duplex, trays, paper_sizes }
+  status       String   @default("OFFLINE") // OFFLINE|ONLINE|PRINTING|NO_PAPER|JAM|LOW_TONER|PAUSED|ERROR
+  stationId    String?
+  createdAt    DateTime @default(now())
+
+  station    Station?           @relation(fields: [stationId], references: [id], onDelete: SetNull)
+  statusLogs PrinterStatusLog[]
+  orders     Order[]
+  printJobs  PrintJob[]
+
+  @@index([stationId])
+  @@index([status])
+}
+
+/// Orden de impresión. status: PENDING|PAID|PROCESSING|COMPLETED|FAILED|CANCELLED
+model Order {
+  id              String    @id @default(cuid())
+  userId          String
+  fileName        String
+  filePath        String // ruta del archivo CIFRADO en UPLOAD_DIR
+  fileKey         String // JSON serializado: { key, iv, authTag } (AES-256-GCM)
+  pages           Int
+  copies          Int       @default(1)
+  color           Boolean   @default(false)
+  duplex          Boolean   @default(false)
+  paperSize       String    @default("A4")
+  basePrice       Decimal   @default(0)
+  totalPrice      Decimal   @default(0)
+  discount        Decimal   @default(0)
+  freePages       Int       @default(0)
+  status          String    @default("PENDING")
+  paymentProvider String? // STRIPE | PAYPAL | DEMO
+  paymentId       String?
+  stationId       String?
+  printerId       String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  station   Station?   @relation(fields: [stationId], references: [id], onDelete: SetNull)
+  printer   Printer?   @relation(fields: [printerId], references: [id], onDelete: SetNull)
+  payments  Payment[]
+  printJobs PrintJob[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([stationId])
+  @@index([printerId])
+  @@index([createdAt])
+}
+
+/// Pago confirmado por webhook (providerId único = idempotencia).
+model Payment {
+  id          String   @id @default(cuid())
+  orderId     String
+  provider    String
+  providerId  String   @unique
+  amount      Decimal
+  status      String
+  webhookData String? // JSON serializado
+  createdAt   DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([provider])
+  @@index([status])
+}
+
+/// Reglas de descuento. type: PERCENTAGE | FIXED | FREE_PAGES
+model DiscountRule {
+  id        String   @id @default(cuid())
+  name      String
+  type      String
+  threshold Int? // páginas mínimas para aplicar
+  value     Decimal
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@index([active])
+}
+
+/// Tarifario por tamaño/color/dúplex.
+model Tariff {
+  id           String   @id @default(cuid())
+  paperSize    String
+  color        Boolean
+  duplex       Boolean
+  pricePerPage Decimal
+  active       Boolean  @default(true)
+  updatedAt    DateTime @updatedAt
+
+  @@unique([paperSize, color, duplex])
+  @@index([active])
+}
+
+/// Historial de telemetría de impresoras.
+model PrinterStatusLog {
+  id         String   @id @default(cuid())
+  printerId  String
+  status     String
+  message    String?
+  recordedAt DateTime @default(now())
+
+  printer Printer @relation(fields: [printerId], references: [id], onDelete: Cascade)
+
+  @@index([printerId])
+  @@index([recordedAt])
+}
+
+/// Trabajo de impresión enviado (o disponible para polling) en una estación.
+model PrintJob {
+  id          String   @id @default(cuid())
+  orderId     String
+  stationId   String?
+  printerId   String?
+  status      String   @default("PENDING")
+  pageCurrent Int      @default(0)
+  pageTotal   Int
+  message     String?
+  attempts    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  order    Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  station  Station?      @relation(fields: [stationId], references: [id], onDelete: SetNull)
+  printer  Printer?      @relation(fields: [printerId], references: [id], onDelete: SetNull)
+  progress JobProgress[]
+
+  @@index([orderId])
+  @@index([stationId])
+  @@index([status])
+}
+
+/// Eventos de progreso página por página reportados por el agente.
+model JobProgress {
+  id          String   @id @default(cuid())
+  jobId       String
+  status      String
+  pageCurrent Int      @default(0)
+  pageTotal   Int      @default(0)
+  message     String?
+  createdAt   DateTime @default(now())
+
+  job PrintJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@index([createdAt])
+}
+
+/// Idempotencia de webhooks. id = identificador del evento del proveedor.
+model WebhookEvent {
+  id        String   @id
+  provider  String
+  type      String
+  createdAt DateTime @default(now())
+
+  @@index([provider])
+}

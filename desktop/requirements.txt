@@ -1,0 +1,17 @@
+# Dependencias principales (instalables con pip install -r requirements.txt)
+websocket-client>=1.7
+requests>=2.31
+cryptography>=42
+python-dotenv>=1.0
+pystray>=0.19
+Pillow>=10
+PyJWT>=2.8
+python-socketio[client]>=5.11
+
+# Condicionales / del sistema (NO instalar con este archivo):
+#   Windows:  pywin32>=306        (win32print, win32api — spooler nativo)
+#   Linux:    pycups>=2.0         (opcional; se usa lp/lpstat si falta)
+#   Red:      zeroconf>=0.132     (mDNS/Bonjour; opcional)
+#   UI:       tkinter             (viene con CPython; en Linux puede requerir
+#                                  python3-tk: sudo apt install python3-tk)
+#   Empaquetado: pyinstaller>=6   (generar .exe antes de ejecutar NSIS)

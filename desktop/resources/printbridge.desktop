@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=PrintBridge Desktop
+GenericName=PrintFlow Print Station Agent
+Comment=Agente de estación de impresión PrintFlow ERP
+Exec=printbridge --tray
+Icon=printbridge
+Terminal=false
+Categories=Office;Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

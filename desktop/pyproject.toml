@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "printbridge-desktop"
+version = "1.0.0"
+description = "Agente de estación de impresión PrintBridge para PrintFlow ERP"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "PrintFlow ERP" }]
+dependencies = [
+  "websocket-client>=1.7",
+  "requests>=2.31",
+  "cryptography>=42",
+  "python-dotenv>=1.0",
+  "pystray>=0.19",
+  "Pillow>=10",
+  "PyJWT>=2.8",
+  "python-socketio[client]>=5.11",
+]
+
+[project.optional-dependencies]
+windows = ["pywin32>=306"]
+linux = ["pycups>=2.0"]
+mdns = ["zeroconf>=0.132"]
+
+[project.scripts]
+printbridge = "printbridge.main:main"
+
+[tool.setuptools]
+packages = ["printbridge"]
+
+[tool.setuptools.data-files]
+"share/printbridge" = ["resources/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

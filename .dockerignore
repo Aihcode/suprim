@@ -1,0 +1,14 @@
+node_modules
+.next
+.git
+.env
+.env.*
+!.env.example
+*.db
+*.db-journal
+uploads
+desktop/**/__pycache__
+desktop/**/*.pyc
+desktop/local_queue.db
+desktop/printbridge/local_queue.db
+npm-debug.log*
