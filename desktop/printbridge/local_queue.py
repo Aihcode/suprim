@@ -45,6 +45,19 @@ class LocalQueue:
         log.info("Cola local SQLite lista en %s", self.db_path)
 
     # ------------------------------------------------------------------ helpers
+    def _ensure_open(self) -> None:
+        """Reabre la conexión si otro hilo la cerró durante el apagado.
+
+        Los trabajos en ejecución pueden persistir su contingencia después de
+        que ``AgentApp.stop()`` cierre la cola; sin esto se reporta un FAILED
+        falso con "Cannot operate on a closed database".
+        """
+        try:
+            self._conn.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+
     @staticmethod
     def _encode(parameters: dict[str, Any] | str | None) -> str:
         if parameters is None:
@@ -72,6 +85,7 @@ class LocalQueue:
         status: str = "LOCAL_QUEUE",
     ) -> None:
         with self._lock:
+            self._ensure_open()
             self._conn.execute(
                 """INSERT INTO local_jobs
                    (job_id, order_id, file_path, parameters, status, attempts, created_at)
@@ -96,6 +110,7 @@ class LocalQueue:
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
+            self._ensure_open()
             row = self._conn.execute(
                 "SELECT * FROM local_jobs WHERE job_id = ?", (str(job_id),)
             ).fetchone()
@@ -103,6 +118,7 @@ class LocalQueue:
 
     def list(self, status: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
+            self._ensure_open()
             if status:
                 rows = self._conn.execute(
                     "SELECT * FROM local_jobs WHERE status = ? ORDER BY created_at ASC",
@@ -116,6 +132,7 @@ class LocalQueue:
 
     def mark_done(self, job_id: str, status: str = "COMPLETED") -> None:
         with self._lock:
+            self._ensure_open()
             self._conn.execute(
                 "UPDATE local_jobs SET status = ? WHERE job_id = ?", (str(status), str(job_id))
             )
@@ -124,6 +141,7 @@ class LocalQueue:
 
     def increment_attempts(self, job_id: str) -> int:
         with self._lock:
+            self._ensure_open()
             self._conn.execute(
                 "UPDATE local_jobs SET attempts = attempts + 1 WHERE job_id = ?", (str(job_id),)
             )
@@ -137,6 +155,7 @@ class LocalQueue:
 
     def delete(self, job_id: str) -> None:
         with self._lock:
+            self._ensure_open()
             self._conn.execute("DELETE FROM local_jobs WHERE job_id = ?", (str(job_id),))
             self._conn.commit()
         log.debug("Trabajo %s eliminado de cola local", job_id)

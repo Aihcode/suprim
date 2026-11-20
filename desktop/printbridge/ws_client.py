@@ -80,8 +80,14 @@ def http_request(
             if json_body is not None:
                 kwargs["json"] = json_body
             elif data is not None:
-                kwargs["data"] = data
+                # requests calcula Content-Length con len(str) (caracteres),
+                # pero urllib3 envía UTF-8 (bytes). Con acentos el servidor
+                # recorta el paquete y Socket.io cierra la sesión por
+                # "invalid payload". Enviar bytes evita el desfase.
+                kwargs["data"] = data.encode("utf-8") if isinstance(data, str) else data
             response = requests.request(method, url, **kwargs)
+            if not (200 <= response.status_code < 300):
+                log.debug("HTTP %s %s -> %s %s", method, url, response.status_code, (response.text or "")[:160])
             return HttpResponse(response.status_code, response.text or "")
         except Exception as exc:  # noqa: BLE001
             log.debug("HTTP %s %s falló: %s", method, url, exc)
@@ -99,6 +105,7 @@ def http_request(
             return HttpResponse(response.status, response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
+        log.debug("HTTP %s %s -> %s %s", method, url, exc.code, body[:160])
         return HttpResponse(exc.code, body)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log.debug("HTTP %s %s falló: %s", method, url, exc)
@@ -117,6 +124,8 @@ class _RawEngineIO:
         self.ping_interval_ms = 25000
         self._send_lock = threading.Lock()
         self._base_url = self.config.engineio_base_url()
+        self._closed = threading.Event()
+        self._namespace_ready = False
 
     # ------------------------------------------------------------- conexión
     def connect(self) -> None:
@@ -130,6 +139,12 @@ class _RawEngineIO:
             raise ConnectionError("Engine.IO no devolvió sid")
         self.ping_interval_ms = int(info.get("pingInterval") or 25000)
         log.debug("Engine.IO sid=%s (ping=%sms)", self.sid[:8], self.ping_interval_ms)
+
+        self._closed.clear()
+        # Socket.IO exige el packet de conexión al namespace antes de cualquier
+        # evento. Sin esto el servidor nunca responde con `40` ni acepta
+        # `station.auth`, y la estación queda "conectada" pero invisible.
+        self._connect_namespace()
 
         self.mode = "polling"
         if websocket is not None:
@@ -154,6 +169,7 @@ class _RawEngineIO:
             self._loop_polling()
 
     def close(self) -> None:
+        self._closed.set()
         if self.ws is not None:
             try:
                 self.ws.close()
@@ -161,8 +177,15 @@ class _RawEngineIO:
                 pass
             self.ws = None
 
+    def _connect_namespace(self) -> None:
+        if self._namespace_ready:
+            return
+        self._namespace_ready = True
+        self._send("40/station,")
+
     # --------------------------------------------------------------- envío
     def _send(self, packet: str) -> None:
+        log.debug("Engine.IO TX %s", packet[:160])
         with self._send_lock:
             if self.mode == "websocket" and self.ws is not None:
                 try:
@@ -185,7 +208,7 @@ class _RawEngineIO:
     # -------------------------------------------------------------- bucles
     def _loop_websocket(self) -> None:
         assert self.ws is not None
-        while not self.client._stop.is_set():
+        while not self.client._stop.is_set() and not self._closed.is_set():
             try:
                 message = self.ws.recv()
             except Exception as exc:  # noqa: BLE001
@@ -198,19 +221,24 @@ class _RawEngineIO:
             self._handle_packet(str(message))
 
     def _loop_polling(self) -> None:
-        while not self.client._stop.is_set():
+        while not self.client._stop.is_set() and not self._closed.is_set():
             url = (
                 f"{self._base_url}/?EIO=4&transport=polling&sid="
                 f"{urllib.parse.quote(self.sid, safe='')}&t={time.time_ns()}"
             )
-            response = http_request("GET", url, timeout=25.0)
+            # El long-poll debe durar más que el pingInterval del servidor:
+            # si el cliente aborta la petición a los 25s, Engine.IO lo interpreta
+            # como "poll connection closed prematurely" y cierra la sesión.
+            poll_timeout = max(60.0, self.ping_interval_ms / 1000 + 20)
+            response = http_request("GET", url, timeout=poll_timeout)
             if response is None or not response.ok:
                 if response is not None:
                     log.debug("Polling Engine.IO devolvió %s", response.status_code)
                 break
-            for packet in response.text.split("\x1e"):
-                if packet:
-                    self._handle_packet(packet)
+            packets = [packet for packet in response.text.split("\x1e") if packet]
+            log.debug("Engine.IO RX %s", [packet[:160] for packet in packets])
+            for packet in packets:
+                self._handle_packet(packet)
 
     # ------------------------------------------------------------- paquetes
     def _handle_packet(self, packet: str) -> None:
@@ -224,6 +252,9 @@ class _RawEngineIO:
             return
         if packet == "1":
             log.debug("Engine.IO CLOSE recibido")
+            # El servidor ya cerró la sesión: seguir haciendo polling sólo
+            # produce 400 "Session ID unknown". Cortar el bucle de inmediato.
+            self._closed.set()
             self.client._mark_disconnected()
             return
         if packet.startswith("0"):
@@ -233,7 +264,9 @@ class _RawEngineIO:
                 pass
             return
         if packet.startswith("40"):
-            self._send('40/station,')
+            # El servidor confirmó el namespace; sólo falta autenticar. No
+            # reenviar `40` aquí o se genera un bucle de ack infinito.
+            self._namespace_ready = True
             self._send_event_auth()
             return
         if packet.startswith("42"):
@@ -277,10 +310,12 @@ class StationClient:
         self._stop = threading.Event()
         self._connected = threading.Event()
         self._auth_event = threading.Event()
+        self._auth_failed = threading.Event()
         self._authenticated = False
         self._callbacks: dict[str, list[Callable[[Any], None]]] = {}
         self._callbacks_lock = threading.RLock()
         self._seen_jobs: set[str] = set()
+        self._seen_lock = threading.Lock()
         self._sio: Any | None = None
         self._raw: _RawEngineIO | None = None
         self._thread: threading.Thread | None = None
@@ -391,11 +426,9 @@ class StationClient:
             "station_id": self.config.station_id,
             "timestamp": utc_now(),
         }
-        if self._raw is not None and self.is_online:
-            try:
-                self._raw.ping()
-            except Exception:  # noqa: BLE001
-                pass
+        # NO enviar el ping Engine.IO (`2`): ese paquete es sólo servidor→cliente.
+        # El servidor lo rechaza con "transport error" y cierra la sesión. El
+        # heartbeat de aplicación (`station.heartbeat`) ya renueva `lastSeen`.
         return self.send("station.heartbeat", payload)
 
     def dispatch(self, event: str, payload: Any) -> None:
@@ -411,6 +444,12 @@ class StationClient:
             if not was_online:
                 self._emit_status("online", "Autenticado en el backend")
             log.info("Estación autenticada correctamente")
+            # Recuperar pendientes por REST: este endpoint entrega el payload
+            # completo (file_url, claves AES y parámetros), a diferencia de un
+            # simple evento `print.job` con sólo el id.
+            threading.Thread(
+                target=self.fetch_pending_jobs, name="pb-pending", daemon=True
+            ).start()
             if not self._synced_this_connection:
                 self._synced_this_connection = True
                 self._emit("_reconnect", None)
@@ -425,17 +464,20 @@ class StationClient:
                 self._connected.set()
                 self._emit_status("online", "DEMO (backend rechazó token)")
             else:
+                self._auth_failed.set()
                 self._mark_disconnected()
+                # Cortar el bucle Engine.IO para que `_run` pueda reintentar
+                # con el backoff en lugar de quedarse en un polling muerto.
+                self._disconnect_current()
             return
 
         if event == "print.job":
             job = dict(payload) if isinstance(payload, dict) else {}
             job_id = str(job.get("job_id") or "")
-            if job_id in self._seen_jobs:
+            if not self._remember_job(job_id):
                 log.debug("print.job duplicado ignorado: %s", job_id)
                 return
-            if job_id:
-                self._seen_jobs.add(job_id)
+            job.setdefault("job_id", job_id)
             job.setdefault("type", "print.job")
             self._emit("print.job", job)
             return
@@ -482,8 +524,25 @@ class StationClient:
         self._raw = _RawEngineIO(self)
         self._connected.set()
         self._emit_status("connecting", "Handshake Engine.IO")
-        self._raw.connect()  # bloquea hasta desconexión
-        return False
+        raw = self._raw
+        threading.Thread(
+            target=self._raw_connect_worker, args=(raw,), name="pb-engineio", daemon=True
+        ).start()
+        return True
+
+    def _raw_connect_worker(self, raw: _RawEngineIO) -> None:
+        """Mantiene el handshake Engine.IO fuera de `_run` para poder hacer
+        timeout de autenticación y reconectar igual que con python-socketio."""
+        try:
+            raw.connect()
+        except Exception as exc:  # noqa: BLE001
+            if self._stop.is_set():
+                return
+            log.warning("No se pudo conectar al backend: %s", exc)
+        finally:
+            if not self._stop.is_set():
+                self._mark_disconnected()
+                self._disconnect_current()
 
     def _connect_socketio(self) -> bool:
         client = socketio.Client(
@@ -530,9 +589,12 @@ class StationClient:
 
     def _wait_for_auth(self, version_before: int) -> bool:
         self._auth_event.clear()
+        self._auth_failed.clear()
         deadline = time.monotonic() + 12.0
         while time.monotonic() < deadline and not self._stop.is_set():
             if version_before != self._credentials_version:
+                return False
+            if self._auth_failed.is_set():
                 return False
             if self._authenticated and self._connected.is_set():
                 return True
@@ -598,38 +660,59 @@ class StationClient:
         log.debug("Evento %s sin mapeo REST; se descarta", event)
         return False
 
+    def _remember_job(self, job_id: str) -> bool:
+        if not job_id:
+            return True
+        with self._seen_lock:
+            if job_id in self._seen_jobs:
+                return False
+            self._seen_jobs.add(job_id)
+        return True
+
+    def fetch_pending_jobs(self) -> int:
+        """Obtiene los pendientes con payload completo y los encola para imprimir."""
+        response = http_request(
+            "GET", self.config.rest_url("/api/station/jobs/pending"),
+            headers=self._rest_headers(), timeout=10.0,
+        )
+        if response is None or not response.ok:
+            log.debug(
+                "No se pudieron obtener trabajos pendientes: %s",
+                getattr(response, "status_code", "sin respuesta"),
+            )
+            return 0
+        try:
+            data = response.json() or {}
+        except ValueError:
+            log.debug("Endpoint de pendientes devolvió JSON inválido")
+            return 0
+        jobs = data.get("jobs", []) if isinstance(data, dict) else data
+        if not isinstance(jobs, list):
+            return 0
+        count = 0
+        for raw in jobs:
+            if not isinstance(raw, dict):
+                continue
+            job = dict(raw)
+            job_id = str(job.get("job_id") or job.get("id") or "")
+            job.setdefault("job_id", job_id)
+            job.setdefault("type", "print.job")
+            if not job.get("file_url"):
+                log.warning("Trabajo %s sigue sin file_url; se omite", job_id or "-")
+                continue
+            if not self._remember_job(job_id):
+                continue
+            log.info("Trabajo %s obtenido de /api/station/jobs/pending", job_id or "-")
+            self._emit("print.job", job)
+            count += 1
+        return count
+
     def _rest_poll_loop(self) -> None:
         while not self._stop.is_set():
             self._stop.wait(self.config.poll_interval_s)
             if self._stop.is_set() or self.is_online:
                 continue
-            response = http_request(
-                "GET", self.config.rest_url("/api/station/jobs/pending"),
-                headers=self._rest_headers(), timeout=8.0,
-            )
-            if response is None or not response.ok:
-                log.debug("Polling REST sin respuesta (backend caído o sin credenciales)")
-                continue
-            try:
-                data = response.json() or {}
-            except ValueError:
-                log.debug("Polling REST devolvió JSON inválido")
-                continue
-            jobs = data.get("jobs", []) if isinstance(data, dict) else data
-            if not isinstance(jobs, list):
-                continue
-            for raw in jobs:
-                if not isinstance(raw, dict):
-                    continue
-                job = dict(raw)
-                job_id = str(job.get("job_id") or "")
-                if job_id in self._seen_jobs:
-                    continue
-                if job_id:
-                    self._seen_jobs.add(job_id)
-                job.setdefault("type", "print.job")
-                log.info("Trabajo %s obtenido por fallback REST", job_id or "-")
-                self._emit("print.job", job)
+            self.fetch_pending_jobs()
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():

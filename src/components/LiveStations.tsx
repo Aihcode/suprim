@@ -11,24 +11,20 @@ interface StationCard {
   name: string;
   location: string;
   status: string;
+  lastSeen: string | null;
   printers: number;
 }
 
-const sampleStations: StationCard[] = [
-  { id: 'pc-01', name: 'PC-01', location: 'Mostrador central', status: 'ONLINE', printers: 2 },
-  { id: 'pc-02', name: 'PC-02', location: 'Planta de producción', status: 'ONLINE', printers: 3 },
-  { id: 'pc-03', name: 'PC-03', location: 'Sala de corte', status: 'ONLINE', printers: 1 },
-];
-
 export function LiveStations() {
-  const [stations, setStations] = useState<StationCard[]>(sampleStations);
+  const [stations, setStations] = useState<StationCard[]>([]);
   const [connected, setConnected] = useState(false);
 
   useEffect(() => {
     let socket: ReturnType<typeof io> | null = null;
     try {
       const baseUrl = process.env.NEXT_PUBLIC_APP_URL || window.location.origin;
-      socket = io(baseUrl, {
+      // El estado de estaciones se difunde por el namespace /admin.
+      socket = io(`${baseUrl.replace(/\/$/, '')}/admin`, {
         path: '/socket.io',
         transports: ['websocket', 'polling'],
         reconnection: true,
@@ -48,6 +44,7 @@ export function LiveStations() {
             name: readString(record.name ?? record.computer_name, `Estación ${index + 1}`),
             location: readString(record.location ?? record.computer_name, 'PrintBridge Desktop'),
             status: readString(record.status ?? (record.last_seen ? 'ONLINE' : 'OFFLINE'), 'OFFLINE'),
+            lastSeen: record.last_seen ? readString(record.last_seen) : null,
             printers: Number(record.printers ?? 1) || 1,
           })),
         );
@@ -82,29 +79,36 @@ export function LiveStations() {
         </div>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        {stations.map((station) => (
-          <div key={station.id} className="card flex items-start gap-3 p-4">
-            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-brand-50 text-brand-600">
-              <Cpu className="h-5 w-5" aria-hidden="true" />
-            </span>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center justify-between gap-2">
-                <p className="truncate text-sm font-bold text-surface-ink">{station.name}</p>
-                <LivePrinterBadge status={station.status} />
+      {stations.length === 0 ? (
+        <div className="card p-6 text-center text-sm text-surface-muted">
+          No hay estaciones PrintBridge registradas todavía. Crea una en Admin › Estaciones y
+          pega su ID y token en el agente de escritorio.
+        </div>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {stations.map((station) => (
+            <div key={station.id} className="card flex items-start gap-3 p-4">
+              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-brand-50 text-brand-600">
+                <Cpu className="h-5 w-5" aria-hidden="true" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="truncate text-sm font-bold text-surface-ink">{station.name}</p>
+                  <LivePrinterBadge status={station.status} lastSeen={station.lastSeen} />
+                </div>
+                <p className="mt-0.5 truncate text-xs text-surface-muted">{station.location}</p>
+                <p className="mt-2 flex items-center gap-1.5 text-[11px] text-surface-muted">
+                  <Printer className="h-3.5 w-3.5" aria-hidden="true" />
+                  {station.printers} impresora{station.printers === 1 ? '' : 's'} disponible{station.printers === 1 ? '' : 's'}
+                </p>
               </div>
-              <p className="mt-0.5 truncate text-xs text-surface-muted">{station.location}</p>
-              <p className="mt-2 flex items-center gap-1.5 text-[11px] text-surface-muted">
-                <Printer className="h-3.5 w-3.5" aria-hidden="true" />
-                {station.printers} impresora{station.printers === 1 ? '' : 's'} disponible{station.printers === 1 ? '' : 's'}
-              </p>
             </div>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      )}
       <p className="mt-3 text-[11px] text-surface-muted">
-        Vista de muestra. La telemetría real se actualiza automáticamente cuando las estaciones
-        PrintBridge envían su estado.
+        Estado real de las estaciones. Se actualiza al autenticar, al recibir telemetría y al
+        desconectar cada agente PrintBridge.
       </p>
     </div>
   );

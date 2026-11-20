@@ -21,6 +21,7 @@ from typing import Any
 # Permite ejecutar también como script: python desktop/printbridge/main.py
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from printbridge.auth import TokenError, decode_station_token  # type: ignore
     from printbridge.config import Config, ConfigError  # type: ignore
     from printbridge.console import Console, ConsoleUnavailable  # type: ignore
     from printbridge.discovery import Discovery  # type: ignore
@@ -30,6 +31,7 @@ if __package__ in (None, ""):
     from printbridge.tray import TrayController, install_autostart, uninstall_autostart  # type: ignore
     from printbridge.ws_client import StationClient  # type: ignore
 else:
+    from .auth import TokenError, decode_station_token
     from .config import Config, ConfigError
     from .console import Console, ConsoleUnavailable
     from .discovery import Discovery
@@ -151,7 +153,7 @@ class AgentApp:
         if event == "job.progress" and self.console:
             self.console.update_job(payload)
 
-    def _on_reconnect(self) -> None:
+    def _on_reconnect(self, _payload: Any = None) -> None:
         log.info("Reconexión detectada: sincronizando cola local")
         self.executor.retry_queued()
         self.executor.sync_pending()
@@ -365,6 +367,25 @@ def main(argv: list[str] | None = None) -> int:
         config.validate()
     except ConfigError as exc:
         log.error("Configuración inválida: %s", exc)
+        return 2
+
+    try:
+        token_info = decode_station_token(config.station_token, config, require_signature=True)
+    except TokenError as exc:
+        log.error("Token de estación inválido: %s", exc)
+        log.error("Copia STATION_ID y STATION_TOKEN desde Admin > Estaciones (PrintBridge) a desktop/.env")
+        return 2
+    token_station = str(
+        token_info.claims.get("stationId")
+        or token_info.claims.get("station_id")
+        or token_info.claims.get("sub")
+        or ""
+    )
+    if token_station and token_station != config.station_id:
+        log.error(
+            "STATION_ID=%s no coincide con el token (%s). Usa el ID de la estación, no su nombre.",
+            config.station_id, token_station,
+        )
         return 2
 
     app = AgentApp(config, with_console=args.console, with_tray=args.tray)

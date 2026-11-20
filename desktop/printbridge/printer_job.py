@@ -128,10 +128,14 @@ class JobExecutor:
 
                 emit("DOWNLOADING", 1, 1, "Documento listo para impresión")
 
+                last_current = 0
+                last_total = 0
+
                 def on_progress(current: int, total: int, message: str) -> None:
+                    nonlocal network_failed, last_current, last_total
+                    last_current, last_total = current, total
                     sent = emit("PRINTING", current, total, message)
                     if not sent:
-                        nonlocal network_failed
                         network_failed = True
 
                 emit("PRINTING", 0, 0, "Enviando al spooler")
@@ -148,7 +152,7 @@ class JobExecutor:
                     emit("LOCAL_QUEUE", message=f"Sin conexión: {cached.name} en cola local")
                     log.warning("Trabajo %s completado localmente; pendiente de sincronización", job_id)
                 else:
-                    if not emit("COMPLETED", message="Impresión completada"):
+                    if not emit("COMPLETED", last_current, last_total, "Impresión completada"):
                         self._persist(job_id, order_id, encrypted_path, job, params, encrypted)
                         emit("LOCAL_QUEUE", message="No se pudo reportar COMPLETED; en cola local")
             return True

@@ -41,6 +41,60 @@ function decodeStationToken(token) {
   }
 }
 
+const stationSockets = new Map(); // stationId -> Set<socket.id>
+const jobUpdateChains = new Map(); // jobId -> Promise (serializa progreso por trabajo)
+
+/** Los handlers async pueden escribir fuera de orden; encadenarlos por job_id
+ *  evita que un PRINTING tardío sobrescriba un COMPLETED. */
+function withJobLock(jobId, task) {
+  const previous = jobUpdateChains.get(jobId) || Promise.resolve();
+  const current = previous.catch(() => undefined).then(task);
+  jobUpdateChains.set(jobId, current);
+  void current.finally(() => {
+    if (jobUpdateChains.get(jobId) === current) jobUpdateChains.delete(jobId);
+  });
+  return current;
+}
+
+function registerStationSocket(stationId, socketId) {
+  if (!stationSockets.has(stationId)) stationSockets.set(stationId, new Set());
+  stationSockets.get(stationId).add(socketId);
+}
+
+function unregisterStationSocket(stationId, socketId) {
+  const sockets = stationSockets.get(stationId);
+  if (!sockets) return;
+  sockets.delete(socketId);
+  if (sockets.size === 0) stationSockets.delete(stationId);
+}
+
+async function stationsStatusPayload() {
+  const stations = await prisma.station.findMany({
+    include: { printers: { select: { id: true } } },
+    orderBy: { createdAt: 'desc' },
+  });
+  return {
+    stations: stations.map((station) => ({
+      id: station.id,
+      name: station.name,
+      computer_name: station.computerName,
+      location: station.computerName,
+      status: (stationSockets.get(station.id)?.size || 0) > 0 ? 'ONLINE' : 'OFFLINE',
+      active: station.active,
+      last_seen: station.lastSeen ? station.lastSeen.toISOString() : null,
+      printers: station.printers.length,
+    })),
+  };
+}
+
+async function broadcastStationsStatus(io) {
+  try {
+    io.of('/admin').emit('stations.status', await stationsStatusPayload());
+  } catch (error) {
+    console.warn('[ws] no se pudo difundir el estado de estaciones:', error.message);
+  }
+}
+
 function progressPayload(socket, data) {
   return {
     type: 'order.progress',
@@ -166,6 +220,7 @@ async function handlePrinterStatus(socket, payload) {
     socket.nsp.server.of('/admin').emit('printer.status', { printers: updates });
     socket.nsp.server.of('/client').emit('printer.status', { printers: updates });
     socket.nsp.server.emit('printer.status', { printers: updates });
+    await broadcastStationsStatus(socket.nsp.server);
   }
 }
 
@@ -221,17 +276,14 @@ app
           socket.data.stationId = stationId;
           socket.data.authenticated = true;
           socket.join(`station:${stationId}`);
+          registerStationSocket(stationId, socket.id);
           socket.emit('station.auth.ok', { type: 'station.auth.ok', station_id: stationId, stationId });
+          await broadcastStationsStatus(io);
           console.log('[ws:station] autenticada', stationId);
 
-          // Si hay trabajos pendientes persiste un evento por cada uno (idempotente para el agente).
-          const pending = await prisma.printJob.findMany({
-            where: { stationId, status: { in: ['PENDING', 'RECEIVED', 'DOWNLOADING', 'LOCAL_QUEUE'] } },
-            orderBy: { createdAt: 'asc' },
-          });
-          for (const job of pending) {
-            socket.emit('print.job', { type: 'print.job', job_id: job.id, order_id: job.orderId, station_id: stationId });
-          }
+          // Los trabajos pendientes NO se reenvían como evento incompleto:
+          // el agente los recupera con GET /api/station/jobs/pending, que es
+          // la única fuente con file_url, claves y parámetros completos.
         } catch (error) {
           console.warn('[ws:station] auth fallida:', error.message);
           socket.emit('station.auth.fail', {
@@ -250,18 +302,18 @@ app
             data: { lastSeen: new Date() },
           });
           socket.emit('station.heartbeat.ack', { timestamp: payload.timestamp || new Date().toISOString() });
+          await broadcastStationsStatus(io);
         } catch (error) {
           console.warn('[ws:station] heartbeat error:', error.message);
         }
       });
 
-      socket.on('job.progress', async (payload = {}) => {
-        try {
-          await handleJobProgress(socket, payload);
-        } catch (error) {
+      socket.on('job.progress', (payload = {}) => {
+        const jobId = payload.job_id || payload.jobId || socket.id;
+        void withJobLock(jobId, () => handleJobProgress(socket, payload)).catch((error) => {
           console.error('[ws:station] job.progress error:', error);
           socket.emit('agent.error', { code: 'PROGRESS_ERROR', message: error.message });
-        }
+        });
       });
 
       socket.on('printer.status', async (payload = {}) => {
@@ -278,7 +330,10 @@ app
       });
 
       socket.on('disconnect', (reason) => {
-        if (socket.data.stationId) console.log('[ws:station] desconectada', socket.data.stationId, reason);
+        if (!socket.data.stationId) return;
+        unregisterStationSocket(socket.data.stationId, socket.id);
+        console.log('[ws:station] desconectada', socket.data.stationId, reason);
+        void broadcastStationsStatus(io);
       });
     });
 
@@ -287,6 +342,9 @@ app
     adminNs.on('connection', (socket) => {
       socket.join('admin:all');
       console.log('[ws:admin] conectado', socket.id);
+      void stationsStatusPayload()
+        .then((payload) => socket.emit('stations.status', payload))
+        .catch((error) => console.warn('[ws:admin] estado inicial falló:', error.message));
 
       socket.on('telemetry.request', (payload = {}) => {
         const stationId = payload.station_id || payload.stationId;
